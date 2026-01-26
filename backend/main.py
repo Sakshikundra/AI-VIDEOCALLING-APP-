@@ -3,227 +3,239 @@ import os
 import logging
 from uuid import uuid4
 from dotenv import load_dotenv
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 
-# Vision Agents imports
+# ================================
+# Vision Agents (UPDATED IMPORTS)
+# ================================
 from vision_agents.core import agents
 from vision_agents.plugins import getstream, gemini
 from vision_agents.core.edge.types import User
 
-# Core events
+# ================================
+# Events
+# ================================
 from vision_agents.core.events import (
     CallSessionParticipantJoinedEvent,
     CallSessionParticipantLeftEvent,
     CallSessionStartedEvent,
     CallSessionEndedEvent,
-    PluginErrorEvent
+    PluginErrorEvent,
 )
 
-# LLM events
 from vision_agents.core.llm.events import (
-    RealtimeUserSpeechTranscriptionEvent, 
-    LLMResponseChunkEvent
+    RealtimeUserSpeechTranscriptionEvent,
+    LLMResponseChunkEvent,
 )
 
-# Setup logging
+# ================================
+# Setup
+# ================================
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("meeting-assistant")
 
-# Load environment variables
 load_dotenv()
 
-# Meeting data storage
-meeting_data = {
-    "transcript": [],
-    "is_active": False
-}
+# Create FastAPI app
+app = FastAPI()
 
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+meeting_agents = {}
+
+# ================================
+# Agent
+# ================================
 async def start_agent(call_id: str):
-    logger.info("🤖 Starting Meeting Assistant...")
-    logger.info(f"📞 Call ID: {call_id}")
-    
-    # Create agent with Gemini Realtime
+    logger.info(f"🚀 Starting Meeting Assistant for call: {call_id}")
+
     agent = agents.Agent(
         edge=getstream.Edge(),
         agent_user=User(
             id="meeting-assistant-bot",
-            name="Meeting Assistant"
+            name="Meeting Assistant",
         ),
         instructions="""
-        You are a meeting transcription bot.
-        
-        CRITICAL RULES - FOLLOW EXACTLY:
-        1. YOU MUST NEVER SPEAK unless someone says "Hey Assistant"
-        2. DO NOT respond to conversations between users
-        3. DO NOT acknowledge anything users say to each other
-        4. DO NOT explain that you're staying silent
-        5. DO NOT say "I should remain silent" or any variation
-        6. ONLY RESPOND when you explicitly hear "Hey Assistant" followed by a question
-        7. If unsure whether to speak: DON'T SPEAK
-        
-        Your ONLY job:
-        - Listen silently
-        - Transcribe everything
-        - Wait for "Hey Assistant"
-        
-        When you DO hear "Hey Assistant":
-        - Answer the question using meeting transcript and notes
-        - Keep answer short and factual
-        - Use only information from this meeting
-        
-        Example:
-        ❌ User: "Let's discuss the budget" → You: STAY COMPLETELY SILENT
-        ❌ User: "What do you think?" → You: STAY COMPLETELY SILENT
-        
-        ✅ User: "Hey Assistant, what are the action items?" → You: Answer with action items
-        ✅ User: "Hey Assistant, summarize the meeting" → You: Provide summary
-        """,
+You are a meeting transcription bot.
+
+CRITICAL RULES:
+1. NEVER speak unless someone says "Hey Assistant"
+2. NEVER respond to normal conversation
+3. ONLY answer questions starting with "Hey Assistant"
+
+Your job:
+- Transcribe everything
+- Stay silent
+- Answer ONLY when triggered
+""",
         llm=gemini.Realtime(fps=0),
     )
-    
-    meeting_data["agent"] = agent
-    meeting_data["call_id"] = call_id
-    
+
+    meeting_agents[call_id] = {
+        "agent": agent,
+        "is_active": False,
+        "transcript": []
+    }
+
+    # ================================
+    # Events
+    # ================================
     @agent.events.subscribe
-    async def handle_session_started(event: CallSessionStartedEvent):
-        meeting_data["is_active"] = True
-        logger.info("🎙️ Meeting started")
-        
-        try:
-            channel = agent.edge.client.channel("messaging", call_id)
-            await channel.watch()
-            meeting_data["channel"] = channel
-            logger.info("✅ Chat channel initialized")
-        except Exception as e:
-            logger.error(f"❌ Chat channel error: {e}")
-    
+    async def on_session_started(event: CallSessionStartedEvent):
+        meeting_agents[call_id]["is_active"] = True
+        logger.info(f"🎙️ Meeting {call_id} started")
+
     @agent.events.subscribe
-    async def handle_participant_joined(event: CallSessionParticipantJoinedEvent):
-        if event.participant.user.id == "meeting-assistant-bot":
+    async def on_participant_joined(event: CallSessionParticipantJoinedEvent):
+        if event.participant.user.id != "meeting-assistant-bot":
+            logger.info(f"👤 Joined: {event.participant.user.name}")
+
+    @agent.events.subscribe
+    async def on_participant_left(event: CallSessionParticipantLeftEvent):
+        if event.participant.user.id != "meeting-assistant-bot":
+            logger.info(f"👋 Left: {event.participant.user.name}")
+
+    @agent.events.subscribe
+    async def on_transcript(event: RealtimeUserSpeechTranscriptionEvent):
+        if not event.text:
             return
-        participant_name = event.participant.user.name
-        logger.info(f"👤 Participant joined: {participant_name}")
-    
+
+        text = event.text.strip()
+        speaker = getattr(event, "participant_id", "Unknown")
+
+        meeting_agents[call_id]["transcript"].append(
+            {"speaker": speaker, "text": text}
+        )
+
+        logger.info(f"📝 [{speaker}] {text}")
+
+        if text.lower().startswith("hey assistant"):
+            question = text[len("hey assistant"):].strip()
+            if not question:
+                return
+
+            context = "\n".join(
+                f"[{e['speaker']}] {e['text']}"
+                for e in meeting_agents[call_id]["transcript"]
+            )
+
+            prompt = f"""
+MEETING TRANSCRIPT:
+{context}
+
+QUESTION:
+{question}
+
+Answer ONLY using the transcript.
+Be short and factual.
+"""
+
+            await agent.simple_response(prompt)
+
     @agent.events.subscribe
-    async def handle_participant_left(event: CallSessionParticipantLeftEvent):
-        if event.participant.user.id == "meeting-assistant-bot":
-            return
-        participant_name = event.participant.user.name
-        logger.info(f"👋 Participant left: {participant_name}")
-    
+    async def on_llm_response(event: LLMResponseChunkEvent):
+        if event.delta:
+            logger.info(f"🤖 {event.delta}")
+
     @agent.events.subscribe
-    async def handle_transcript(event: RealtimeUserSpeechTranscriptionEvent):
-        """Handle transcripts"""
-        if not event.text or len(event.text.strip()) == 0:
-            return
-        
-        speaker = getattr(event, 'participant_id', 'Unknown')
-        transcript_text = event.text
-        
-        # Store transcript
-        meeting_data["transcript"].append({
-            "speaker": speaker,
-            "text": transcript_text,
-            "timestamp": getattr(event, 'timestamp', None)
-        })
-        
-        logger.info(f"📝 [{speaker}]: {transcript_text}")
-        
-        # Q&A handling
-        if transcript_text.lower().startswith("hey assistant"):
-            question = transcript_text[13:].strip()
-            
-            if question:
-                logger.info(f"❓ Q&A triggered: {question}")
-                
-                # Build context from transcript
-                context = "MEETING TRANSCRIPT:\n\n"
-                for entry in meeting_data["transcript"]:
-                    context += f"[{entry['speaker']}]: {entry['text']}\n"
-                
-                prompt = f"""
-                {context}
-                
-                USER QUESTION: {question}
-                
-                Answer based ONLY on the meeting transcript above.
-                Be concise and helpful.
-                """
-                
-                try:
-                    await agent.simple_response(prompt)
-                    logger.info(f"🤖 Responding to question")
-                except Exception as e:
-                    logger.error(f"❌ Q&A error: {e}")
-    
+    async def on_session_ended(event: CallSessionEndedEvent):
+        meeting_agents[call_id]["is_active"] = False
+        logger.info(f"🛑 Meeting {call_id} ended")
+
     @agent.events.subscribe
-    async def handle_llm_response(event: LLMResponseChunkEvent):
-        """Log agent responses"""
-        if hasattr(event, 'delta') and event.delta:
-            logger.info(f"🤖 Agent: {event.delta}")
-    
-    @agent.events.subscribe
-    async def handle_session_ended(event: CallSessionEndedEvent):
-        meeting_data["is_active"] = False
-        logger.info("🛑 Meeting ended")
-        logger.info(f"📊 Final Stats:")
-        logger.info(f"   - Transcript entries: {len(meeting_data['transcript'])}")
-    
-    @agent.events.subscribe
-    async def handle_errors(event: PluginErrorEvent):
+    async def on_error(event: PluginErrorEvent):
         logger.error(f"❌ Plugin error: {event.error_message}")
-        if event.is_fatal:
-            logger.error("🚨 Fatal error")
-    
-    # Initialize agent
-    await agent.create_user()
-    call = agent.edge.client.video.call("default", call_id)
-    
-    logger.info("✅ Joining call...")
-    with await agent.join(call):
-        logger.info("\n" + "="*60)
-        logger.info("🎙️  MEETING ASSISTANT ACTIVE!")
-        logger.info("="*60)
-        logger.info("\n📋 Features:")
-        logger.info("   1. ✅ Auto-transcription")
-        logger.info("   2. ✅ Q&A (say 'Hey Assistant' + question)")
-        logger.info(f"\n🔗 Meeting ID: {call_id}")
-        logger.info("\nPress Ctrl+C to stop\n")
-        logger.info("="*60 + "\n")
-        
-        await agent.finish()
-    
-    logger.info("✅ Agent finished")
 
-def print_meeting_summary():
-    """Print meeting summary"""
-    print("\n" + "="*70)
-    print("📋 MEETING SUMMARY")
-    print("="*70)
-    
-    print(f"\n📝 Transcript ({len(meeting_data['transcript'])} entries):")
-    print("-"*70)
-    for entry in meeting_data['transcript']:
-        print(f"[{entry['speaker']}]: {entry['text']}")
-    
-    print("\n" + "="*70)
-    print("✅ Summary Complete")
-    print("="*70 + "\n")
-
-if __name__ == "__main__":
-    call_id = os.getenv("CALL_ID", f"meeting-{uuid4().hex[:8]}")
-    
-    print("\n" + "="*70)
-    print("🎯 SMART MEETING ASSISTANT")
-    print("="*70)
-    print("\n✨ Features:")
-    print("   1. Auto-transcription")
-    print("   2. Q&A with 'Hey Assistant'")
-    print("="*70 + "\n")
-    
+    # ================================
+    # Start Agent
+    # ================================
     try:
-        asyncio.run(start_agent(call_id))
-    except KeyboardInterrupt:
-        print("\n\n🛑 Stopped by user")
-    finally:
-        if meeting_data["transcript"]:
-            print_meeting_summary()
+        await agent.create_user()
+        call = agent.edge.client.video.call("default", call_id)
+        logger.info(f"✅ Joining call {call_id}...")
+        
+        async with agent.join(call):
+            logger.info(f"🎧 Assistant ACTIVE for {call_id}")
+            await agent.finish()
+            
+        logger.info(f"✅ Agent finished for {call_id}")
+    except Exception as e:
+        logger.error(f"❌ Error starting agent: {e}")
+        if call_id in meeting_agents:
+            del meeting_agents[call_id]
+
+# ================================
+# API Endpoints
+# ================================
+
+@app.post("/start-assistant")
+async def start_assistant_endpoint(request: dict):
+    """Start the meeting assistant for a call"""
+    try:
+        call_id = request.get("call_id")
+        if not call_id:
+            return JSONResponse({"error": "call_id is required"}, status_code=400)
+        
+        # Start the agent in the background
+        asyncio.create_task(start_agent(call_id))
+        
+        return JSONResponse({
+            "status": "success",
+            "message": f"Meeting assistant started for call {call_id}"
+        })
+    except Exception as e:
+        logger.error(f"Error starting assistant: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/transcript/{call_id}")
+async def get_transcript(call_id: str):
+    """Get the transcript for a call"""
+    try:
+        if call_id not in meeting_agents:
+            return JSONResponse({"transcript": []})
+        
+        transcript = meeting_agents[call_id].get("transcript", [])
+        return JSONResponse({"transcript": transcript})
+    except Exception as e:
+        logger.error(f"Error getting transcript: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/status/{call_id}")
+async def get_status(call_id: str):
+    """Get the status of a meeting"""
+    try:
+        if call_id not in meeting_agents:
+            return JSONResponse({"status": "not_found"})
+        
+        is_active = meeting_agents[call_id].get("is_active", False)
+        return JSONResponse({
+            "call_id": call_id,
+            "is_active": is_active,
+            "status": "active" if is_active else "inactive"
+        })
+    except Exception as e:
+        logger.error(f"Error getting status: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("✨ Meeting Assistant Backend Started")
+
+# ================================
+# Main
+# ================================
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -20,11 +20,18 @@ export function TranscriptPanel() {
       return;
     }
 
-    const callId = process.env.NEXT_PUBLIC_CALL_ID;
-    const channel = client.channel("messaging", callId);
+    const callId = call.id;
+    
+    // Create channel with at least 2 members (user + bot)
+    const channel = client.channel("messaging", callId, {
+      members: [call.state.localParticipant.userId, "meeting-assistant-bot"],
+      name: `Meeting: ${callId}`,
+    });
 
     // Watch the channel
-    channel.watch();
+    channel.watch().catch((error) => {
+      console.log("Channel creation info:", error.message);
+    });
 
     console.log("✅ Listening for closed captions");
 
